@@ -4,128 +4,152 @@ from PIL import Image
 import io
 import zipfile
 
-def split_cover_image(uploaded_file, front_w, height_mm, spine_w, flap_w):
-    # 1. PDF 파일을 이미지로 변환 (고해상도 300DPI)
+def split_cover_image(uploaded_file, front_w, height_mm, spine_w, flap_w, bleed_mm):
+    # 1. PDF 로드
     doc = fitz.open(stream=uploaded_file.read(), filetype="pdf")
-    page = doc.load_page(0)  # 첫 번째 페이지만 사용
+    page = doc.load_page(0)
     pix = page.get_pixmap(dpi=300)
     img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
     
-    # 2. 전체 너비 계산 (날개+뒷표지+세네카+앞표지+날개)
-    # 일반적인 펼침면 순서: [뒷날개] - [뒷표지] - [세네카] - [앞표지] - [앞날개]
-    # 만약 날개가 없다면 0을 입력받음
-    total_mm = (flap_w * 2) + (front_w * 2) + spine_w
+    # 2. 픽셀 비율(Scale) 계산 방식 변경 (핵심 수정!)
+    # 높이(Height)를 기준으로 비율을 잡는 것이 가장 정확합니다.
+    # 인쇄용 PDF 높이 = 실제 책 높이 + (위아래 도련 * 2)
+    total_height_mm = height_mm + (bleed_mm * 2)
+    scale = img.height / total_height_mm
     
-    # 3. 픽셀 변환 비율 계산 (이미지 실제 크기 / 사용자가 입력한 총 mm)
-    # 이렇게 하면 도련(여백)이 포함되어 있어도 비율대로 정확히 잘립니다.
-    scale = img.width / total_mm
-    
-    # 각 파트의 픽셀 너비 계산
+    # 3. 각 파트의 픽셀 너비 계산
     p_flap = flap_w * scale
     p_cover = front_w * scale
     p_spine = spine_w * scale
+    p_bleed = bleed_mm * scale  # 도련 픽셀 크기
     
-    # 4. 이미지 자르기 (Left, Top, Right, Bottom)
+    # 4. 자르기 시작 위치 (x 좌표) 보정
+    # 도련이 있다면, 0이 아니라 '왼쪽 도련'만큼 띄우고 시작해야 함
+    
+    # 전체 이미지 너비에서 '실제 책 너비 합계'를 뺀 나머지가 좌우 여백임.
+    # PDF가 중앙 정렬되어 있다고 가정하고 시작점을 잡음.
+    actual_content_width_px = (p_flap * 2) + (p_cover * 2) + p_spine
+    if flap_w == 0: # 날개 없는 경우
+         actual_content_width_px = (p_cover * 2) + p_spine
+         
+    # 시작점 x = (전체 이미지 폭 - 실제 책 내용 폭) / 2
+    x = (img.width - actual_content_width_px) / 2
+    
     height_px = img.height
     
-    # 순서: 뒷날개 -> 뒷표지 -> 세네카 -> 앞표지 -> 앞날개
-    x = 0
+    # 상하 도련(여백) 잘라내기 위한 y 좌표 설정
+    y_top = p_bleed
+    y_bottom = height_px - p_bleed
     
-    # (1) 뒷날개 (Back Flap)
+    # --- 자르기 시작 ---
+    
+    # (1) 뒷날개
     img_back_flap = None
     if flap_w > 0:
-        img_back_flap = img.crop((x, 0, x + p_flap, height_px))
+        img_back_flap = img.crop((x, y_top, x + p_flap, y_bottom))
         x += p_flap
         
-    # (2) 뒷표지 (Back Cover)
-    img_back = img.crop((x, 0, x + p_cover, height_px))
+    # (2) 뒷표지
+    img_back = img.crop((x, y_top, x + p_cover, y_bottom))
     x += p_cover
     
-    # (3) 세네카 (Spine)
-    img_spine = img.crop((x, 0, x + p_spine, height_px))
+    # (3) 세네카
+    img_spine = img.crop((x, y_top, x + p_spine, y_bottom))
     x += p_spine
     
-    # (4) 앞표지 (Front Cover)
-    img_front = img.crop((x, 0, x + p_cover, height_px))
+    # (4) 앞표지
+    img_front = img.crop((x, y_top, x + p_cover, y_bottom))
     x += p_cover
     
-    # (5) 앞날개 (Front Flap)
+    # (5) 앞날개
     img_front_flap = None
     if flap_w > 0:
-        img_front_flap = img.crop((x, 0, img.width, height_px)) # 남은 끝까지
+        img_front_flap = img.crop((x, y_top, x + p_flap, y_bottom))
         
     return img_front, img_spine, img_back, img_front_flap, img_back_flap
 
 # --- Streamlit UI ---
-st.title("✂️ PDF 표지 자동 분리기")
-st.markdown("펼침 표지 PDF를 올리면 **[앞표지, 뒷표지, 세네카, 날개]**로 조각내서 PNG로 저장해 줍니다.")
+st.set_page_config(page_title="PDF 표지 분리기", layout="wide")
+st.title("✂️ 인쇄용 PDF 표지 자동 분리기")
+st.markdown("""
+인쇄용 PDF(펼침면)를 업로드하면 **앞표지, 뒷표지, 세네카, 날개**로 정확하게 잘라줍니다.
+도련(여백)이 있어도 자동으로 계산해서 알맹이만 남겨드립니다.
+""")
 
-# 1. 사이드바 설정
-st.sidebar.header("📏 도서 사이즈 입력 (mm)")
-width_mm = st.sidebar.number_input("가로 (앞표지 1면)", value=152)
-height_mm = st.sidebar.number_input("세로", value=225)
-spine_mm = st.sidebar.number_input("세네카 (책등)", value=20)
-flap_mm = st.sidebar.number_input("날개 폭 (없으면 0)", value=100)
+col_input, col_preview = st.columns([1, 2])
 
-uploaded_pdf = st.file_uploader("PDF 펼침 표지 파일 업로드", type=["pdf"])
+with col_input:
+    st.header("1. 사이즈 입력 (mm)")
+    st.info("💡 종이책 실제 판형을 입력하세요.")
+    width_mm = st.number_input("가로 (표지 1면)", value=150)
+    height_mm = st.number_input("세로 (높이)", value=210)
+    spine_mm = st.number_input("세네카 (책등)", value=15)
+    flap_mm = st.number_input("날개 폭 (없으면 0)", value=100)
+    
+    st.write("---")
+    st.header("2. 여백 설정")
+    bleed_mm = st.number_input("사방 여백 (도련)", value=3.0, step=0.5, help="보통 인쇄소 파일은 사방 3mm 여백이 있습니다.")
+    
+    uploaded_pdf = st.file_uploader("PDF 파일 업로드", type=["pdf"])
 
-if uploaded_pdf and st.button("이미지 자르기 실행"):
-    with st.spinner("PDF를 고화질 이미지로 변환하고 자르는 중..."):
+if uploaded_pdf and width_mm > 0:
+    with col_preview:
+        st.header("3. 결과 확인")
         try:
-            # 함수 실행
-            f, s, b, ff, bf = split_cover_image(uploaded_pdf, width_mm, height_mm, spine_mm, flap_mm)
+            f, s, b, ff, bf = split_cover_image(uploaded_pdf, width_mm, height_mm, spine_mm, flap_mm, bleed_mm)
             
-            # 결과 보여주기
-            st.success("자르기 완료! 아래에서 확인하고 다운로드하세요.")
+            # 탭으로 보기 좋게 정리
+            tab1, tab2, tab3 = st.tabs(["펼쳐보기", "상세보기", "다운로드"])
             
-            col1, col2, col3 = st.columns([1, 0.2, 1])
-            with col1:
-                st.image(b, caption="뒷표지", use_container_width=True)
-            with col2:
-                st.image(s, caption="세네카", use_container_width=True)
-            with col3:
-                st.image(f, caption="앞표지", use_container_width=True)
+            with tab1:
+                st.caption("잘라낸 이미지를 나열한 모습입니다.")
+                cols = st.columns([1, 1, 0.2, 1, 1] if flap_mm > 0 else [1, 0.2, 1])
                 
-            if flap_mm > 0:
-                st.write("---")
-                c4, c5 = st.columns(2)
-                with c4: st.image(bf, caption="뒷날개", width=150)
-                with c5: st.image(ff, caption="앞날개", width=150)
-
-            # ZIP 파일 생성 및 다운로드 버튼
-            zip_buffer = io.BytesIO()
-            with zipfile.ZipFile(zip_buffer, "w") as zf:
-                # 앞표지 저장
-                img_byte = io.BytesIO()
-                f.save(img_byte, format="PNG")
-                zf.writestr("front_cover.png", img_byte.getvalue())
-                
-                # 세네카 저장
-                img_byte = io.BytesIO()
-                s.save(img_byte, format="PNG")
-                zf.writestr("spine.png", img_byte.getvalue())
-                
-                # 뒷표지 저장
-                img_byte = io.BytesIO()
-                b.save(img_byte, format="PNG")
-                zf.writestr("back_cover.png", img_byte.getvalue())
-
                 if flap_mm > 0:
-                    img_byte = io.BytesIO()
-                    bf.save(img_byte, format="PNG")
-                    zf.writestr("back_flap.png", img_byte.getvalue())
-                    
-                    img_byte = io.BytesIO()
-                    ff.save(img_byte, format="PNG")
-                    zf.writestr("front_flap.png", img_byte.getvalue())
+                    cols[0].image(bf, caption="뒷날개", use_container_width=True)
+                    cols[1].image(b, caption="뒷표지", use_container_width=True)
+                    cols[2].image(s, caption="책등", use_container_width=True)
+                    cols[3].image(f, caption="앞표지", use_container_width=True)
+                    cols[4].image(ff, caption="앞날개", use_container_width=True)
+                else:
+                    cols[0].image(b, caption="뒷표지", use_container_width=True)
+                    cols[1].image(s, caption="책등", use_container_width=True)
+                    cols[2].image(f, caption="앞표지", use_container_width=True)
 
-            st.download_button(
-                label="📦 모든 조각 한번에 다운로드 (ZIP)",
-                data=zip_buffer.getvalue(),
-                file_name="split_covers.zip",
-                mime="application/zip"
-            )
-            
+            with tab2:
+                c1, c2, c3 = st.columns(3)
+                c1.image(f, caption="앞표지 (확대)")
+                c2.image(s, caption="세네카 (확대)")
+                c3.image(b, caption="뒷표지 (확대)")
+
+            with tab3:
+                # ZIP 파일 생성
+                zip_buffer = io.BytesIO()
+                with zipfile.ZipFile(zip_buffer, "w") as zf:
+                    def save_to_zip(image, name):
+                        img_byte = io.BytesIO()
+                        image.save(img_byte, format="PNG")
+                        zf.writestr(f"{name}.png", img_byte.getvalue())
+
+                    save_to_zip(f, "front_cover")
+                    save_to_zip(s, "spine")
+                    save_to_zip(b, "back_cover")
+                    if flap_mm > 0:
+                        save_to_zip(ff, "front_flap")
+                        save_to_zip(bf, "back_flap")
+
+                st.download_button(
+                    label="📦 모든 조각 ZIP 다운로드",
+                    data=zip_buffer.getvalue(),
+                    file_name="split_covers.zip",
+                    mime="application/zip",
+                    type="primary"
+                )
+                
         except Exception as e:
             st.error(f"오류가 발생했습니다: {e}")
-            st.warning("입력한 사이즈 합계가 PDF 비율과 너무 다르거나, 파일에 문제가 있을 수 있습니다.")
+            st.warning("PDF 파일의 크기가 입력하신 사이즈와 비율이 맞지 않을 수 있습니다. 도련(여백) 수치를 조절해보세요.")
+
+elif not uploaded_pdf:
+    with col_preview:
+        st.info("👈 왼쪽에서 PDF 파일을 업로드해주세요.")
